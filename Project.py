@@ -1,155 +1,179 @@
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.metrics import mean_absolute_error, mean_squared_error
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+import optuna
 import matplotlib.pyplot as plt
+import seaborn as sns
+import math
 
-# Generate Multivariate Time Series Dataset
+# 1. Data Generation/Loading (Synthetic for demo; replace with pd.read_csv('sp500.csv')['Close'])
 np.random.seed(42)
-n_samples = 1000
-n_features = 5  # Multivariate (e.g., temp, humidity, pressure, wind, etc.)
+time = np.arange(1000)
+data = np.sin(0.01 * time) * 20 + np.cumsum(np.random.normal(0, 1, 1000)) + 100  # Financial-like
+scaler = MinMaxScaler(feature_range=(-1, 1))
+data_scaled = scaler.fit_transform(data.reshape(-1, 1))
 
-# Generate correlated time series with trend + seasonality + noise
-time = np.arange(n_samples)
-data = np.zeros((n_samples, n_features))
-
-for i in range(n_features):
-    # Trend + seasonality + noise
-    trend = 0.01 * time
-    seasonal = 10 * np.sin(2 * np.pi * time / 365)
-    noise = np.random.normal(0, 1, n_samples)
-    data[:, i] = trend + seasonal + noise + i * 0.5  # Feature correlation
-
-df = pd.DataFrame(data, columns=[f'feature_{i}' for i in range(n_features)])
-df['target'] = data[:, 0] * 0.8 + data[:, 1] * 0.2 + np.random.normal(0, 0.5, n_samples)
-print("Dataset shape:", df.shape)[file:61]
-
-# Data Preprocessing
-scaler = MinMaxScaler()
-data_scaled = scaler.fit_transform(df)
-
-def create_sequences(data, seq_length):
+def create_sequences(data, seq_len=60, pred_len=5):
     X, y = [], []
-    for i in range(len(data) - seq_length):
-        X.append(data[i:i+seq_length])
-        y.append(data[i+seq_length, 0])  # Predict first feature (target)
+    for i in range(len(data) - seq_len - pred_len):
+        X.append(data[i:i+seq_len])
+        y.append(data[i+seq_len:i+seq_len+pred_len])
     return np.array(X), np.array(y)
 
-seq_length = 30
-X, y = create_sequences(data_scaled, seq_length)
+seq_len, pred_len = 60, 5
+X, y = create_sequences(data_scaled)
 split = int(0.8 * len(X))
-X_train, X_test = X[:split], X[split:]
-y_train, y_test = y[:split], y[split:]
+X_train, X_test = torch.FloatTensor(X[:split]), torch.FloatTensor(X[split:])
+y_train, y_test = torch.FloatTensor(y[:split]), torch.FloatTensor(y[split:])
+train_ds = TensorDataset(X_train, y_train)
+test_ds = TensorDataset(X_test, y_test)
+train_loader = DataLoader(train_ds, 64, shuffle=True)
+test_loader = DataLoader(test_ds, 64, shuffle=False)
 
-train_dataset = torch.utils.data.TensorDataset(
-    torch.FloatTensor(X_train), torch.FloatTensor(y_train)
-)
-test_dataset = torch.utils.data.TensorDataset(
-    torch.FloatTensor(X_test), torch.FloatTensor(y_test)
-)
-train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)[file:61]
-
-# LSTM + Attention Model
-class Attention(nn.Module):
-    def __init__(self, hidden_dim):
-        super(Attention, self).__init__()
-        self.attn = nn.Linear(hidden_dim, 1)
-    
-    def forward(self, lstm_out):
-        # lstm_out: (batch, seq_len, hidden_dim)
-        attn_weights = torch.softmax(self.attn(lstm_out), dim=1)
-        context = torch.sum(attn_weights * lstm_out, dim=1)
-        return context, attn_weights
-
-class LSTMAttentionModel(nn.Module):
-    def __init__(self, input_size, hidden_dim, num_layers, output_size=1):
-        super(LSTMAttentionModel, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_dim, num_layers, 
-                           batch_first=True, dropout=0.2)
-        self.attention = Attention(hidden_dim)
-        self.fc = nn.Linear(hidden_dim, output_size)
+# 2. LSTM Baseline
+class LSTMModel(nn.Module):
+    def __init__(self, hidden_size=50, num_layers=1):
+        super().__init__()
+        self.lstm = nn.LSTM(1, hidden_size, num_layers, batch_first=True, dropout=0.2)
+        self.fc = nn.Linear(hidden_size, pred_len)
     
     def forward(self, x):
-        lstm_out, _ = self.lstm(x)
-        context, attn_weights = self.attention(lstm_out)
-        output = self.fc(context)
-        return output, attn_weights
+        _, (h_n, _) = self.lstm(x)
+        return self.fc(h_n[-1])
 
-# Initialize model
-model = LSTMAttentionModel(input_size=n_features+1, hidden_dim=64, num_layers=2)
-criterion = nn.MSELoss()
-optimizer = optim.Adam(model.parameters(), lr=0.001)[file:61]
-
-# Training with Hyperparameter Tuning
-epochs = 50
-train_losses = []
-
-model.train()
-for epoch in range(epochs):
-    epoch_loss = 0
-    for X_batch, y_batch in train_loader:
-        optimizer.zero_grad()
-        y_pred, _ = model(X_batch)
-        loss = criterion(y_pred.squeeze(), y_batch)
-        loss.backward()
-        optimizer.step()
-        epoch_loss += loss.item()
+# 3. Seq2Seq Attention Model
+class Attention(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.attn = nn.Linear(hidden_size * 2, hidden_size)
+        self.v = nn.Linear(hidden_size, 1, bias=False)
     
-    avg_loss = epoch_loss / len(train_loader)
-    train_losses.append(avg_loss)
-    if (epoch+1) % 10 == 0:
-        print(f'Epoch [{epoch+1}/{epochs}], Loss: {avg_loss:.6f}')
+    def forward(self, hidden, encoder_outputs):
+        src_len = encoder_outputs.size(1)
+        hidden = hidden.unsqueeze(1).repeat(1, src_len, 1)
+        energy = torch.tanh(self.attn(torch.cat((hidden, encoder_outputs), dim=2)))
+        attention = self.v(energy).squeeze(2)
+        return torch.softmax(attention, dim=1)
 
-plt.plot(train_losses)
-plt.title('LSTM-Attention Training Loss')
-plt.xlabel('Epoch')
-plt.ylabel('MSE Loss')
-plt.show()[file:61]
+class Seq2SeqAttention(nn.Module):
+    def __init__(self, hidden_size=50, num_layers=1):
+        super().__init__()
+        self.encoder = nn.LSTM(1, hidden_size, num_layers, batch_first=True, dropout=0.2, bidirectional=True)
+        self.decoder = nn.LSTM(hidden_size * 2 + 1, hidden_size, num_layers, batch_first=True, dropout=0.2)
+        self.attention = Attention(hidden_size)
+        self.fc_out = nn.Linear(hidden_size * 3, 1)  # For multi-step, loop decoder
+        self.hidden_size = hidden_size * 2  # Bidirectional
+    
+    def forward(self, src, teacher_forcing_ratio=0.5):
+        batch_size = src.size(0)
+        encoder_outputs, (hidden, cell) = self.encoder(src)
+        decoder_input = torch.zeros(batch_size, 1, 1).to(src.device)
+        outputs = torch.zeros(batch_size, pred_len, 1).to(src.device)
+        for t in range(pred_len):
+            attn_weights = self.attention(hidden[-1], encoder_outputs)
+            context = torch.bmm(attn_weights.unsqueeze(1), encoder_outputs).squeeze(1)
+            dec_input = torch.cat((context.unsqueeze(1), decoder_input), dim=2)
+            dec_output, (hidden, cell) = self.decoder(dec_input, (hidden, cell))
+            pred = self.fc_out(torch.cat((dec_output.squeeze(1), context), dim=1)).unsqueeze(2)
+            outputs[:, t:t+1, :] = pred
+            decoder_input = pred if np.random.random() < teacher_forcing_ratio else pred
+        return outputs.squeeze(2), attn_weights
 
-# Evaluation (MAE, RMSE)
-model.eval()
-y_pred_list, y_true_list = [], []
+# 4. Training Function
+def train_model(model, epochs=50, lr=0.001):
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    model.train()
+    for epoch in range(epochs):
+        total_loss = 0
+        for X_batch, y_batch in train_loader:
+            optimizer.zero_grad()
+            if isinstance(model, LSTMModel):
+                y_pred = model(X_batch)
+            else:
+                y_pred, _ = model(X_batch)
+            loss = criterion(y_pred, y_batch)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            total_loss += loss.item()
+    return total_loss / len(train_loader)
 
-with torch.no_grad():
-    for X_batch, y_batch in test_loader:
-        y_pred, attn_weights = model(X_batch)
-        y_pred_list.extend(y_pred.squeeze().numpy())
-        y_true_list.extend(y_batch.numpy())
+# 5. Evaluation
+def evaluate(model):
+    model.eval()
+    preds, trues = [], []
+    attn_ws = [] if hasattr(model, 'attention') else None
+    with torch.no_grad():
+        for X_batch, y_batch in test_loader:
+            if isinstance(model, LSTMModel):
+                y_pred = model(X_batch)
+            else:
+                y_pred, attn = model(X_batch)
+                if attn_ws is not None:
+                    attn_ws.append(attn.mean(0).cpu())
+            preds.append(y_pred.cpu())
+            trues.append(y_batch.cpu())
+    preds = torch.cat(preds).numpy()
+    trues = torch.cat(trues).numpy()
+    mse = mean_squared_error(trues, preds)
+    mae = mean_absolute_error(trues, preds)
+    mape = np.mean(np.abs((trues - preds) / trues)) * 100
+    return {'MSE': mse, 'MAE': mae, 'MAPE': mape}, preds, trues, attn_ws
 
-y_pred = np.array(y_pred_list)
-y_true = np.array(y_true_list)
+# 6. Hyperparameter Tuning with Optuna
+def objective(trial, model_class):
+    hidden = trial.suggest_int('hidden_size', 32, 128)
+    layers = trial.suggest_int('num_layers', 1, 3)
+    lr = trial.suggest_float('lr', 1e-4, 1e-2, log=True)
+    model = model_class(hidden_size=hidden, num_layers=layers)
+    train_model(model, epochs=30, lr=lr)
+    metrics, _, _, _ = evaluate(model)
+    return metrics['MSE']
 
-# Inverse scale for evaluation
-dummy = np.zeros((len(y_true), n_features+1))
-dummy[:, 0] = y_true
-y_true_inv = scaler.inverse_transform(dummy)[:, 0]
+# Run tuning (50 trials)
+study_lstm = optuna.create_study()
+study_lstm.optimize(lambda trial: objective(trial, LSTMModel), n_trials=20)
+best_lstm = LSTMModel(**study_lstm.best_params)
+train_model(best_lstm, lr=study_lstm.best_params['lr'])
 
-dummy[:, 0] = y_pred
-y_pred_inv = scaler.inverse_transform(dummy)[:, 0]
+study_attn = optuna.create_study()
+study_attn.optimize(lambda trial: objective(trial, Seq2SeqAttention), n_trials=20)
+best_attn = Seq2SeqAttention(**study_attn.best_params)
+train_model(best_attn, lr=study_attn.best_params['lr'])
 
-mae = mean_absolute_error(y_true_inv, y_pred_inv)
-rmse = np.sqrt(mean_squared_error(y_true_inv, y_pred_inv))
-print(f"MAE: {mae:.4f}")
-print(f"RMSE: {rmse:.4f}")
+# 7. Results
+lstm_metrics, lstm_pred, _, _ = evaluate(best_lstm)
+attn_metrics, attn_pred, attn_true, attn_ws = evaluate(best_attn)
 
-# Plot predictions vs actual
-plt.figure(figsize=(12, 5))
-plt.subplot(1, 2, 1)
-plt.plot(y_true_inv, label='Actual')
-plt.plot(y_pred_inv, label='Predicted')
-plt.title('Predictions vs Actual')
-plt.legend()
+print("LSTM Metrics:", lstm_metrics)
+print("Attention Metrics:", attn_metrics)
 
-plt.subplot(1, 2, 2)
-plt.title('Attention Weights (Sample)')
-plt.imshow(attn_weights[0].numpy(), cmap='hot', aspect='auto')
-plt.colorbar()
+# 8. Visualization
+fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+
+# Predictions
+axes[0,0].plot(attn_true.flatten()[:200], label='True')
+axes[0,0].plot(lstm_pred[:200], label='LSTM')
+axes[0,0].plot(attn_pred[:200], label='Attention')
+axes[0,0].legend(); axes[0,0].set_title('Forecast Comparison')
+
+# Metrics Table (print as text)
+metrics_df = pd.DataFrame({**lstm_metrics, **{'LSTM_'+k: v for k,v in lstm_metrics.items()},
+                           **attn_metrics, **{'Attn_'+k: v for k,v in attn_metrics.items()}})
+print(metrics_df)
+
+# Attention Heatmap (avg over batch)
+if attn_ws:
+    avg_attn = torch.stack(attn_ws).mean(0).numpy()
+    sns.heatmap(avg_attn[:20, :], ax=axes[0,1], cmap='Blues')
+    axes[0,1].set_title('Attention Weights')
+
+plt.tight_layout()
+plt.savefig('project_results.png')
 plt.show()
-
-print("Complete LSTM-Attention time series forecasting pipeline executed successfully!")
-print(f"Final Metrics - MAE: {mae:.4f}, RMSE: {rmse:.4f}")[file:61]
