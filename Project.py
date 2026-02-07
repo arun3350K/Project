@@ -1,169 +1,139 @@
-import numpy as np
 import pandas as pd
-import yfinance as yf
-from sklearn.preprocessing import MinMaxScaler
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.optimizers import Adam
+import numpy as np
 import matplotlib.pyplot as plt
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+import cvxpy as cp
+from sklearn.preprocessing import StandardScaler
 
-# =============================================================================
-# 1. DATA PREPARATION - Download & Process Financial Time Series
-# =============================================================================
-print("📈 Downloading stock data...")
-ticker = "AAPL"  # Change to any stock symbol
-data = yf.download(ticker, start="2018-01-01", end="2026-02-01")['Close'].values
-data = data.reshape(-1, 1)
+# Step 1: Load California Tobacco Control Data (Proposition 99, 1988)
+# Download from: https://raw.githubusercontent.com/bcastillo/synthcontrol/master/data/smoking.csv
+url = "https://raw.githubusercontent.com/bcastillo/synthcontrol/master/data/smoking.csv"
+data = pd.read_csv(url, index_col=0)
 
-# Normalize data
-scaler = MinMaxScaler(feature_range=(0, 1))
-data_scaled = scaler.fit_transform(data)
+print("Data shape:", data.shape)
+print("Columns (states):", data.columns.tolist())
+print("\nFirst few rows:")
+print(data.head())
 
-# Create sequences (60-day lookback)
-def create_sequences(data, seq_length=60):
-    X, y = [], []
-    for i in range(seq_length, len(data)):
-        X.append(data[i-seq_length:i, 0])
-        y.append(data[i, 0])
-    return np.array(X), np.array(y)
+# Treated unit: California (first column), Intervention: 1988 Q4 (time 35, 0-indexed)
+treated_unit = 'California'
+intervention_time = 35  # Quarter when Prop 99 passed
+pre_period = data.index < intervention_time
+post_period = data.index >= intervention_time
 
-seq_length = 60
-X, y = create_sequences(data_scaled, seq_length)
-X = X.reshape((X.shape[0], X.shape[1], 1))
+# Step 2: Synthetic Control Class (Optimized via Quadratic Programming)
+class SyntheticControl:
+    def __init__(self):
+        self.weights_ = None
+        self.rmspe_pre_ = None
+        
+    def fit(self, Y, treated_idx, pre_period_mask):
+        """Fit synthetic control using pre-treatment periods"""
+        Y_pre = Y.loc[pre_period_mask].values  # Pre-treatment matrix (T_pre x J+1)
+        y_treated = Y_pre[:, treated_idx]      # Treated outcome pre-treatment
+        X_pool = np.delete(Y_pre, treated_idx, axis=1)  # Donor pool pre-treatment
+        
+        # Optimization: Minimize ||Xw - y||^2 s.t. w >= 0, sum(w) = 1
+        w = cp.Variable(X_pool.shape[1])
+        objective = cp.Minimize(cp.sum_squares(X_pool @ w - y_treated))
+        constraints = [cp.sum(w) == 1, w >= 0]
+        problem = cp.Problem(objective, constraints)
+        problem.solve(solver=cp.ECOS, verbose=False)
+        
+        self.weights_ = w.value
+        self.Y_ = Y.values
+        self.treated_idx_ = treated_idx
+        
+        # Pre-treatment RMSPE (good fit if low, e.g., <0.05)
+        synth_pre = X_pool @ self.weights_
+        self.rmspe_pre_ = np.sqrt(np.mean((synth_pre - y_treated)**2))
+        print(f"Pre-treatment RMSPE: {self.rmspe_pre_:.4f}")
+        
+        return self
+    
+    def predict(self, Y):
+        """Generate synthetic control for full period"""
+        donor_pool = np.delete(Y.values, self.treated_idx_, axis=1)
+        return donor_pool @ self.weights_
+    
+    def plot(self, title="SCM: Actual vs Synthetic"):
+        Y_synth = self.predict(self.Y_)
+        treated_actual = self.Y_[:, self.treated_idx_]
+        
+        plt.figure(figsize=(12, 6))
+        plt.plot(self.Y_.index, treated_actual, 'b-', label='California (Treated)', linewidth=2)
+        plt.plot(self.Y_.index, Y_synth, 'r--', label='Synthetic Control', linewidth=2)
+        plt.axvline(x=data.index[intervention_time], color='k', linestyle=':', label='Intervention (1988 Q4)')
+        plt.fill_between(self.Y_.index, treated_actual, Y_synth, alpha=0.3, color='gray', label='Treatment Gap')
+        plt.ylabel('Log Cigarette Sales per Capita')
+        plt.xlabel('Time (Quarterly)')
+        plt.title(title)
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.show()
 
-# Train-test split (80-20)
-split = int(0.8 * len(X))
-X_train, X_test = X[:split], X[split:]
-y_train, y_test = y[:split], y[split:]
-print(f"✅ Training samples: {len(X_train)}, Test samples: {len(X_test)}")
+# Step 3: Fit SCM Model
+treated_idx = list(data.columns).index(treated_unit)
+model = SyntheticControl()
+model.fit(data, treated_idx, pre_period)
 
-# =============================================================================
-# 2. LSTM MODEL WITH UNCERTAINTY QUANTIFICATION (Monte Carlo Dropout)
-# =============================================================================
-print("\n🔧 Building LSTM model...")
-model = Sequential([
-    LSTM(50, return_sequences=True, input_shape=(seq_length, 1)),
-    Dropout(0.2),  # Keep dropout ON for uncertainty
-    LSTM(50, return_sequences=False),
-    Dropout(0.2),
-    Dense(25),
-    Dense(1)
-])
+print("\nDonor Weights (top 5):")
+weights_df = pd.DataFrame({
+    'State': [col for col in data.columns if col != treated_unit],
+    'Weight': model.weights_
+}).sort_values('Weight', ascending=False)
+print(weights_df.head())
 
-model.compile(optimizer=Adam(learning_rate=0.001), loss='mean_squared_error')
-print("🚀 Training model...")
-history = model.fit(X_train, y_train, epochs=50, batch_size=32, 
-                   validation_split=0.1, verbose=1)
+# Step 4: Calculate ATT (Average Treatment Effect on Treated)
+synth_full = model.predict(data)
+att_post = data[treated_unit][post_period] - synth_full[post_period]
+avg_att = att_post.mean()
+print(f"\nPost-Intervention ATT: {avg_att:.3f} (negative = policy reduced sales)")
+print(f"ATT Std: {att_post.std():.3f}")
 
-# =============================================================================
-# 3. PREDICTION WITH 95% CONFIDENCE INTERVALS
-# =============================================================================
-print("\n🎯 Generating predictions with uncertainty...")
-def predict_with_uncertainty(model, X_test, n_samples=100):
-    """Monte Carlo Dropout for uncertainty quantification"""
-    predictions = np.array([model(X_test, training=True) for _ in range(n_samples)])
-    mean_pred = np.mean(predictions, axis=0)
-    std_pred = np.std(predictions, axis=0)
-    conf_lower = mean_pred - 1.96 * std_pred  # 95% CI
-    conf_upper = mean_pred + 1.96 * std_pred
-    return mean_pred, conf_lower, conf_upper
+# Step 5: Placebo/In-Space Test (Robustness)
+def placebo_test(data, model_class, treated_idx, intervention_time, n_placebos=10):
+    """Run SCM treating each donor as 'treated' (placebo)"""
+    placebos = []
+    donor_states = [i for i in range(data.shape[1]) if i != treated_idx]
+    
+    for placebo_idx in donor_states[:n_placebos]:
+        placebo_model = model_class()
+        placebo_model.fit(data, placebo_idx, data.index < intervention_time)
+        synth_placebo = placebo_model.predict(data)
+        placebo_att = data.iloc[post_period, placebo_idx].mean() - synth_placebo[post_period].mean()
+        placebos.append(placebo_att)
+    
+    return np.array(placebos)
 
-mean_pred, conf_lower, conf_upper = predict_with_uncertainty(model, X_test)
+placebo_atts = placebo_test(data, SyntheticControl, treated_idx, intervention_time)
+p_value = np.mean(np.abs(placebo_atts) >= np.abs(avg_att))
+print(f"\nPlacebo p-value: {p_value:.3f} (significant if <0.1)")
 
-# Inverse transform to original scale
-y_test_inv = scaler.inverse_transform(y_test.reshape(-1, 1)).flatten()
-mean_pred_inv = scaler.inverse_transform(mean_pred.reshape(-1, 1)).flatten()
-conf_lower_inv = scaler.inverse_transform(conf_lower.reshape(-1, 1)).flatten()
-conf_upper_inv = scaler.inverse_transform(conf_upper.reshape(-1, 1)).flatten()
-
-# =============================================================================
-# 4. EVALUATION METRICS & COVERAGE
-# =============================================================================
-mae = mean_absolute_error(y_test_inv, mean_pred_inv)
-rmse = np.sqrt(mean_squared_error(y_test_inv, mean_pred_inv))
-coverage = np.mean((y_test_inv >= conf_lower_inv) & (y_test_inv <= conf_upper_inv))
-
-print(f"\n📊 PRODUCTION METRICS:")
-print(f"MAE: ${mae:.2f}")
-print(f"RMSE: ${rmse:.2f}")
-print(f"95% CI Coverage: {coverage:.1%} (Target: 95%)")
-
-# =============================================================================
-# 5. VISUALIZATION WITH CONFIDENCE BANDS
-# =============================================================================
-plt.figure(figsize=(15, 8))
-
-# Plot actual vs predicted with confidence bands
-plt.subplot(2, 1, 1)
-plt.plot(y_test_inv[:200], label='Actual', linewidth=2)
-plt.plot(mean_pred_inv[:200], label='LSTM Prediction', linewidth=2)
-plt.fill_between(range(200), conf_lower_inv[:200], conf_upper_inv[:200], 
-                 alpha=0.3, label='95% Confidence Interval')
-plt.title(f'{ticker} Stock Price Forecast (First 200 test points)', fontsize=14)
-plt.ylabel('Price ($)')
+# Plot placebo distribution
+plt.figure(figsize=(10, 5))
+plt.hist(placebo_atts, bins=10, alpha=0.7, label='Placebo ATT', color='orange')
+plt.axvline(avg_att, color='red', linewidth=3, label=f'California ATT ({avg_att:.3f})')
+plt.xlabel('ATT Estimate')
+plt.ylabel('Frequency')
+plt.title('Placebo Test: California Effect vs Donor States')
 plt.legend()
 plt.grid(True, alpha=0.3)
-
-# Plot training history
-plt.subplot(2, 1, 2)
-plt.plot(history.history['loss'], label='Training Loss')
-plt.plot(history.history['val_loss'], label='Validation Loss')
-plt.title('Model Training History')
-plt.xlabel('Epoch')
-plt.ylabel('Loss (MSE)')
-plt.legend()
-plt.grid(True, alpha=0.3)
-
-plt.tight_layout()
 plt.show()
 
-# =============================================================================
-# 6. PRODUCTION-READY CLASS (Self-contained)
-# =============================================================================
-class FinancialLSTMPredictor:
-    """
-    Production-ready LSTM with uncertainty quantification for financial time series.
-    """
-    def __init__(self, seq_length=60, n_samples=100):
-        self.seq_length = seq_length
-        self.n_samples = n_samples
-        self.model = None
-        self.scaler = MinMaxScaler()
-    
-    def prepare_data(self, ticker, start_date, end_date):
-        """Download and prepare sequences"""
-        data = yf.download(ticker, start=start_date, end=end_date)['Close'].values
-        data_scaled = self.scaler.fit_transform(data.reshape(-1, 1))
-        X, y = create_sequences(data_scaled, self.seq_length)
-        return X, y, data
-    
-    def build_model(self):
-        """Build LSTM with dropout for uncertainty"""
-        self.model = Sequential([
-            LSTM(50, return_sequences=True, input_shape=(self.seq_length, 1)),
-            Dropout(0.2),
-            LSTM(50, return_sequences=False),
-            Dropout(0.2),
-            Dense(25),
-            Dense(1)
-        ])
-        self.model.compile(optimizer=Adam(0.001), loss='mean_squared_error')
-    
-    def predict_with_ci(self, X_test):
-        """Predict with 95% confidence intervals"""
-        predictions = np.array([self.model(X_test, training=True) 
-                              for _ in range(self.n_samples)])
-        mean_pred = np.mean(predictions, axis=0)
-        std_pred = np.std(predictions, axis=0)
-        return (mean_pred - 1.96*std_pred, mean_pred, mean_pred + 1.96*std_pred)
+# Step 6: Summary Results
+print("\n" + "="*50)
+print("SYNTHETIC CONTROL METHOD RESULTS")
+print("="*50)
+print(f"Treated Unit: {treated_unit}")
+print(f"Intervention: 1988 Q4 (time {intervention_time})")
+print(f"Pre-RMSPE: {model.rmspe_pre_:.4f}")
+print(f"Post-ATT: {avg_att:.3f} packs/capita")
+print(f"Placebo p-value: {p_value:.3f}")
+print(f"Key Donors: {weights_df.head(3)['State'].tolist()}")
+print("="*50)
 
-print("\n✅ COMPLETE PROJECT EXECUTED SUCCESSFULLY!")
-print("📋 Features implemented:")
-print("   • Real stock data (Yahoo Finance)")
-print("   • Multivariate-ready LSTM architecture")
-print("   • Monte Carlo Dropout uncertainty quantification")
-print("   • 95% confidence intervals")
-print("   • Production metrics (MAE, RMSE, Coverage)")
-print("   • Professional visualizations")
-print("   • Self-contained production class")
+model.plot()
+plt.show()
+
+print("\n✓ Complete SCM analysis: Model fit, ATT, placebo test, diagnostics complete!")
